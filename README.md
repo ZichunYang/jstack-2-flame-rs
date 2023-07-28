@@ -30,3 +30,7 @@ To successfully run this project, the following environment requirements must be
 yarn install
 yarn tauri dev
 ```
+
+## Example Images:
+![img.png](img.png)
+![img_1.png](img_1.png)

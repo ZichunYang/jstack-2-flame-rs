@@ -1,23 +1,18 @@
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::process::{Command, Output};
 use std::sync::RwLock;
 
-use lazy_static::lazy_static;
-use serde::{Deserialize, Serialize};
-use regex::Regex;
-
-lazy_static! {
+lazy_static::lazy_static! {
     static ref GLOBAL_NODE: RwLock<FlameGraphNode> = RwLock::new(FlameGraphNode::new("Root", 0));
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Process {
     pub pid: u32,
     pub name: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct FlameGraphNode {
     pub name: String,
     pub num: u32,
@@ -34,28 +29,24 @@ impl FlameGraphNode {
     }
 
     fn get_or_insert(&mut self, name: &str) -> &mut Self {
-        let child = self.children.entry(name.to_string()).or_insert_with(|| Self::new(name, 1));
-        child
+        self.children
+            .entry(name.to_string())
+            .or_insert_with(|| Self::new(name, 1))
     }
 
     pub fn merge(&mut self, other: FlameGraphNode) {
         self.num += other.num;
 
         for (name, other_child) in other.children {
-            match self.children.entry(name) {
-                Entry::Occupied(mut entry) => {
-                    entry.get_mut().merge(other_child);
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(other_child);
-                }
-            }
+            self.children
+                .entry(name)
+                .and_modify(|e| e.merge(other_child.clone()))
+                .or_insert(other_child);
         }
     }
 }
 
 pub fn get_java_processes() -> Result<Vec<Process>, String> {
-    let mut processes: Vec<Process> = Vec::new();
     let output = Command::new("jps")
         .arg("-l")
         .output()
@@ -67,105 +58,91 @@ pub fn get_java_processes() -> Result<Vec<Process>, String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let pid: u32 = parts[0].parse().map_err(|e| format!("Failed to parse PID: {}", e))?;
-        let name = parts[1].to_string();
-        processes.push(Process { pid, name });
-    }
+    let processes: Result<Vec<Process>, String> = stdout
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() == 2 {
+                Some(
+                    parts[0]
+                        .parse::<u32>()
+                        .map(|pid| Process {
+                            pid,
+                            name: parts[1].to_string(),
+                        })
+                        .map_err(|e| format!("Failed to parse PID: {}", e)),
+                )
+            } else {
+                None
+            }
+        })
+        .collect();
 
-    Ok(processes)
+    processes
 }
 
-fn parse_stack_trace(lines: Vec<&str>) -> FlameGraphNode {
-    let mut root = FlameGraphNode::new("Root", 1);
-    let name = lines[0].split("\"").collect::<Vec<_>>()[1];
-    let re = Regex::new(r"[0-9]+").unwrap();
-    let name = re.replace_all(&name, "{num}");
-    let child = root.get_or_insert(&name);
 
-    let mut current_node = child;
-    for &line in lines[1..].iter().rev() {
-        if line.is_empty() {
-            continue;
+fn parse_stack_trace(lines: &[&str]) -> FlameGraphNode {
+    let mut current_node = FlameGraphNode::new("Root", 0);
+    let name_parts: Vec<&str> = lines[0].split("\"").collect();
+    if let Some(name) = name_parts.get(1) {
+        if lines.len() <= 1 {
+            return current_node;
         }
-        let trimmed = line.trim_start().replace("\t", "");
-        if !trimmed.starts_with("at")
-            && !trimmed.starts_with("-") {
-            continue;
+        for line in lines {
+            if line.contains("CompilerThread") || line.contains("GC Thread") || line.contains("VM Thread") {
+                return current_node;
+            }
         }
-        let trimmed = trimmed.strip_prefix("-").unwrap_or(&trimmed).trim();
-        let trimmed = trimmed.strip_prefix("at").unwrap_or(&trimmed).trim();
-        current_node = current_node.get_or_insert(trimmed);
+        current_node.num += 1;
+        let mut parent_node = current_node.get_or_insert(name);
+        for &line in lines[1..].iter().rev() {
+            if !line.is_empty() {
+                let trimmed = line.trim_start().replace("\t", "");
+                if !trimmed.starts_with("at") && !trimmed.starts_with("-") {
+                    continue;
+                }
+                let trimmed = trimmed.strip_prefix("-").unwrap_or(&trimmed).trim();
+                let trimmed = trimmed.strip_prefix("at").unwrap_or(&trimmed).trim();
+
+                parent_node = parent_node.get_or_insert(trimmed);
+            }
+        }
     }
-    root
+    current_node
 }
+
 
 pub fn clear_jstack_info() {
     *GLOBAL_NODE.write().unwrap() = FlameGraphNode::new("Root", 0);
 }
 
-// Parse the jstack info
 pub fn parse_jstack_info(pid: &str) -> Result<FlameGraphNode, Box<dyn std::error::Error>> {
     let mut root = GLOBAL_NODE.write().unwrap();
 
-    // Execute the jstack command
     let output: Output = Command::new("jstack")
-        .arg(pid.to_string())
+        .arg(pid)
         .output()?;
 
-    // Check if the command ran successfully
-    // if !output.status.success() {
-    //     let err = String::from_utf8_lossy(&output.stderr);
-    // return Err(format!("jstack command failed: {}", err).into());
-    // }
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("jstack command failed: {}", err).into());
+    }
 
-    // Convert the output to a string
     let jstack_info = String::from_utf8_lossy(&output.stdout);
 
-    // This example assumes that separate stack traces are separated by two newlines.
-    if let Some(index) = jstack_info.find('"') {
-        // Add 1 to the index to skip the '"' itself
-        let substring = &jstack_info[index..];
-        let strings = substring
-            .split("\"VM Thread").collect::<Vec<_>>()[0]
-            .split("\n").collect::<Vec<_>>();
-        let split_strings = split_strings(strings);
-        for line in split_strings {
-            if line.is_empty() {
-                continue;
-            }
-            let parsed = parse_stack_trace(line);
-            root.merge(parsed)
+    for stack_trace in jstack_info.split("\n\n") {
+        let lines: Vec<&str> = stack_trace.lines().collect();
+        let lines: Vec<&str> = lines
+            .iter()
+            .filter(|&&line| !line.trim().is_empty())
+            .cloned()
+            .collect();
+        if !lines.is_empty() {
+            let parsed = parse_stack_trace(&lines);
+            root.merge(parsed);
         }
     }
+
     Ok(root.clone())
-}
-
-fn split_strings(input: Vec<&str>) -> Vec<Vec<&str>> {
-    let mut result: Vec<Vec<&str>> = Vec::new();
-    let mut current_line: Vec<&str> = Vec::new();
-
-    for line in input {
-        if !line.starts_with('\t')
-            && !current_line.is_empty()
-            && !line.starts_with(' ') {
-            if !current_line.is_empty() {
-                result.push(current_line);
-            }
-            current_line = Vec::new();
-        }
-        if !line.is_empty() {
-            current_line.push(line);
-        }
-    }
-
-    if !current_line.is_empty() {
-        result.push(current_line);
-    }
-
-    result
 }
